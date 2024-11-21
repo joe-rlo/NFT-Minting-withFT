@@ -1,0 +1,41 @@
+/target
+/node_modules
+/misc_hidden
+
+/indexer/node_modules
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.lock
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Documentation
+doc/
+
+# Testing
+tests/
+*.test
+*.spec
+tests/config.ts
+
+# Miscellaneous
+*.bak
+*.swp
+*.swo
+*~
+
