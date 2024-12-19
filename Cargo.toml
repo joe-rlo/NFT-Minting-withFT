@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 near-sdk = { version = "5.4.0", features = ["legacy"]}
 time = "0.3.35"
+near-contract-standards = "5.0.0" 
 
 [dev-dependencies]
 near-sdk = { version = "5.0.0", features = ["unit-testing","legacy"]}

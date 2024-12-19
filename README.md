@@ -1,6 +1,6 @@
 # NEAR NFT Contract With FT Minting & Distribution
 
-A feature-rich NFT smart contract built for the NEAR Protocol that supports minting with FT tokens, royalties, and configurable payment distribution.
+A feature-rich NFT smart contract built for the NEAR Protocol that supports minting with FT tokens, royalties, configurable payment distribution, and premint functionality.
 
 ## Features
 
@@ -12,6 +12,8 @@ A feature-rich NFT smart contract built for the NEAR Protocol that supports mint
 - 🔄 Updatable parameters by owner
 - 📊 Comprehensive metadata support
 - 🏷️ Token trait tracking
+- 🎯 Premint functionality for specific token IDs
+- 🔒 Toggleable premint-only mode
 
 ## Contract Structure
 
@@ -20,6 +22,7 @@ The contract implements the following key components:
 - Token ownership tracking
 - FT payment distribution system
 - Royalty management (NEP-199)
+- Premint system for specific token IDs
 
 ## Initialization
 
@@ -52,16 +55,14 @@ near call YOUR_CONTRACT_ID new '{
 }' --accountId OWNER_ACCOUNT_ID
 ```
 
-## Minting
+## Minting Modes
 
-To mint NFTs, you need to:
-1. Approve the NFT contract to use your FT tokens
-2. Call the FT contract to transfer tokens and mint NFTs
-
+### Regular Minting
+To mint NFTs using FT tokens:
 ```bash
 # First approve the NFT contract to use your tokens
-near call $FT_TOKEN_ID ft_approve '{
-    "account_id": "'$NFT_CONTRACT_ID'",
+near call $FT_TOKEN_ID ft_transfer '{
+    "receiver_id": "'$NFT_CONTRACT_ID'",
     "amount": "1000000000000000000000000"
 }' --accountId BUYER_ID --deposit 0.0001
 
@@ -71,6 +72,27 @@ near call $FT_TOKEN_ID ft_transfer_call '{
     "amount": "3000000000000000000000000",
     "msg": "{\"number_of_tokens\": 3}"
 }' --accountId BUYER_ID --deposit 0.000000000000000000000001
+```
+
+### Preminting (Owner Only)
+```bash
+# Premint a specific token ID
+near call $CONTRACT_ID premint '{
+    "token_id": "123",
+    "receiver_id": "receiver.near"
+}' --accountId OWNER_ID --deposit 0.000000000000000000000001
+```
+
+### Premint-Only Mode
+```bash
+# Enable premint-only mode (disables regular minting)
+near call $CONTRACT_ID set_premint_only '{"enabled": true}' --accountId OWNER_ID --deposit 0.000000000000000000000001
+
+# Disable premint-only mode (allows regular minting)
+near call $CONTRACT_ID set_premint_only '{"enabled": false}' --accountId OWNER_ID --deposit 0.000000000000000000000001
+
+# Check current premint-only status
+near view $CONTRACT_ID is_premint_only
 ```
 
 ## Supply Information

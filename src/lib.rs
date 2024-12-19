@@ -12,6 +12,11 @@ use near_sdk::serde_json::json;
 use near_sdk::serde_json;
 use near_sdk::{PromiseOrValue};
 use near_sdk::ext_contract;
+use near_contract_standards::non_fungible_token::metadata::{
+    NFTContractMetadata, TokenMetadata, NFT_METADATA_SPEC,
+};
+use near_contract_standards::non_fungible_token::{Token, TokenId};
+use near_contract_standards::non_fungible_token::NonFungibleToken;
 
 #[ext_contract(ext_ft)]
 trait FungibleToken {
@@ -26,6 +31,10 @@ pub enum StorageKey {
     PayoutWallets,
     RoyaltyWallets,
     TraitCounts,
+    NonFungibleToken,
+    TokenMetadataById,
+    Enumeration,
+    Approval,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -66,30 +75,13 @@ pub struct NFTMetadata {
     pub reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
-#[serde(crate = "near_sdk::serde")]
-pub struct TokenMetadata {
-    pub title: Option<String>,       // ex. "Arch Nemesis: Mail Carrier" or "Parcel #5055"
-    pub description: Option<String>, // free-form description
-    pub media: Option<String>,       // URL to associated media, preferably to decentralized, content-addressed storage
-    pub media_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of content referenced by the `media` field
-    pub copies: Option<u64>,         // number of copies of this set of metadata in existence when token was minted
-    pub issued_at: Option<u64>,      // When token was issued or minted
-    pub expires_at: Option<u64>,     // When token expires
-    pub starts_at: Option<u64>,      // When token starts being valid
-    pub updated_at: Option<u64>,     // When token was last updated
-    pub extra: Option<String>,       // anything extra the NFT wants to store on-chain
-    pub reference: Option<String>,   // URL to an off-chain JSON file with more info
-    pub reference_hash: Option<Base64VecU8>, // Base64-encoded sha256 hash of JSON from reference field
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub struct TokenData {
     pub token_id: String,
     pub owner_id: String,
     pub metadata: TokenMetadata,
-    pub approved_account_ids: HashMap<AccountId, u64>,
+    pub approved_account_ids: Option<HashMap<AccountId, bool>>,
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
@@ -115,6 +107,7 @@ pub struct FtOnTransferArgs {
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
     pub owner_id: AccountId,
+    pub tokens: NonFungibleToken,
     pub tokens_per_owner: LookupMap<AccountId, UnorderedSet<String>>,
     pub token_metadata: UnorderedMap<String, TokenMetadata>,
     pub token_ids: UnorderedSet<String>,
@@ -127,6 +120,7 @@ pub struct Contract {
     pub total_royalty: u8,
     pub metadata: NFTMetadata,
     pub attribute_counts: LookupMap<String, HashMap<String, u32>>,
+    pub premint_only: bool,
 }
 
 #[near_bindgen]
@@ -145,8 +139,15 @@ impl Contract {
         assert!(!env::state_exists(), "Already initialized");
         assert!(metadata.reference.len() > 0, "Reference URL required");
 
-        Self {
-            owner_id,
+        let this = Self {
+            tokens: NonFungibleToken::new(
+                StorageKey::NonFungibleToken,
+                owner_id.clone(),
+                Some(StorageKey::TokenMetadataById),
+                Some(StorageKey::Enumeration),
+                Some(StorageKey::Approval),
+            ),
+            owner_id: owner_id.clone(),
             tokens_per_owner: LookupMap::new(StorageKey::TokensPerOwner { 
                 account_id_hash: Vec::new() 
             }),
@@ -167,13 +168,43 @@ impl Contract {
             total_royalty,
             metadata,
             attribute_counts: LookupMap::new(StorageKey::TraitCounts),
-        }
+            premint_only: true,
+        };
+
+        
+         // Log contract initialization
+        let init_log = json!({
+            "standard": "nep171",
+            "version": "1.1.0",
+            "event": "init",
+            "data": {
+                "owner_id": owner_id.to_string()
+            }
+        });
+        log_str(&format!("EVENT_JSON:{}", init_log.to_string()));
+
+        this
     }
 
     #[payable]
-    pub fn mint_many(&mut self, number_of_tokens: u64) -> Vec<TokenData> {
-        // This function should not be called directly anymore
+    pub fn mint_many(&mut self, _number_of_tokens: u64) -> Vec<TokenData> {
+        // Implementation
         unimplemented!("Please use FT transfer to mint tokens");
+    }
+
+    fn get_next_token_id(&self) -> String {
+        let mut next_id = 0;
+        
+        // Keep incrementing until we find an unminted ID
+        while self.token_ids.contains(&next_id.to_string()) {
+            next_id += 1;
+            assert!(
+                next_id < self.max_supply,
+                "No more tokens available to mint"
+            );
+        }
+        
+        next_id.to_string()
     }
 
     fn internal_mint_many(
@@ -199,7 +230,7 @@ impl Contract {
         let mut minted_tokens = Vec::with_capacity(number_of_tokens as usize);
 
         for _ in 0..number_of_tokens {
-            let token_id = format!("{}", self.total_supply + 1);
+            let token_id = self.get_next_token_id();
             
             // Create metadata for this token
             let metadata = TokenMetadata {
@@ -208,7 +239,7 @@ impl Contract {
                 media: self.metadata.base_uri.clone().map(|uri| format!("{}/{}.png", uri, token_id)),
                 media_hash: None,
                 copies: Some(1),
-                issued_at: Some(env::block_timestamp()),
+                issued_at: Some(env::block_timestamp().to_string()),
                 expires_at: None,
                 starts_at: None,
                 updated_at: None,
@@ -217,18 +248,25 @@ impl Contract {
                 reference_hash: None,
             };
 
-            // Store token data
+            // Update the core NFT data structure
+            self.tokens.internal_mint_with_refund(
+                token_id.clone(),
+                receiver_id.clone(),
+                Some(metadata.clone()),
+                None,
+            );
+
+            // Store token data in custom storage
             tokens_set.insert(&token_id);
             self.token_metadata.insert(&token_id, &metadata);
             self.token_ids.insert(&token_id);
             self.total_supply += 1;
 
-            // Add to return vector
             minted_tokens.push(TokenData {
                 token_id: token_id.clone(),
                 owner_id: receiver_id.to_string(),
                 metadata,
-                approved_account_ids: HashMap::new(),
+                approved_account_ids: None,
             });
         }
 
@@ -241,30 +279,35 @@ impl Contract {
     // Single implementation of distribute_payment
     fn distribute_payment(&mut self, amount: U128) {
         let mut remaining_amount = amount.0;
+        let mut promise = Promise::new(self.ft_token_id.clone()); // Start with the FT contract as the initial promise
         
         for wallet in &self.payout_wallets {
             let wallet_share = (remaining_amount as f64 * (wallet.share as f64 / 100.0)) as u128;
             if wallet_share > 0 {
-                ext_ft::ext(self.ft_token_id.clone())
-                    .with_attached_deposit(NearToken::from_yoctonear(1))
-                    .ft_transfer(
-                        wallet.account_id.clone(),
-                        U128(wallet_share),
-                        None,
-                    );
+                promise = promise.then(
+                    ext_ft::ext(self.ft_token_id.clone())
+                        .with_attached_deposit(NearToken::from_yoctonear(1))
+                        .ft_transfer(
+                            wallet.account_id.clone(),
+                            U128(wallet_share),
+                            None,
+                        )
+                );
                 remaining_amount -= wallet_share;
             }
         }
 
         // Send any dust to the first wallet
         if remaining_amount > 0 && !self.payout_wallets.is_empty() {
-            ext_ft::ext(self.ft_token_id.clone())
-                .with_attached_deposit(NearToken::from_yoctonear(1))
-                .ft_transfer(
-                    self.payout_wallets[0].account_id.clone(),
-                    U128(remaining_amount),
-                    None,
-                );
+            promise = promise.then(
+                ext_ft::ext(self.ft_token_id.clone())
+                    .with_attached_deposit(NearToken::from_yoctonear(1))
+                    .ft_transfer(
+                        self.payout_wallets[0].account_id.clone(),
+                        U128(remaining_amount),
+                        None,
+                    )
+            );
         }
     }
 
@@ -274,6 +317,11 @@ impl Contract {
         amount: U128,
         msg: String,
     ) -> PromiseOrValue<U128> {
+        assert!(
+            !self.premint_only,
+            "Minting is currently restricted to premint only"
+        );
+
         let args: FtOnTransferArgs = serde_json::from_str(&msg)
             .unwrap_or(FtOnTransferArgs { number_of_tokens: Some(1) });
         
@@ -291,10 +339,10 @@ impl Contract {
             number_of_tokens
         );
 
-        // Log the mint event
+        // Log the standard NEP-171 mint event
         let nft_mint_log = json!({
             "standard": "nep171",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "event": "nft_mint",
             "data": [{
                 "owner_id": sender_id,
@@ -302,6 +350,19 @@ impl Contract {
             }]
         });
         log_str(&format!("EVENT_JSON:{}", nft_mint_log.to_string()));
+
+        // Log detailed metadata event
+        let metadata_log = json!({
+            "receiver_id": sender_id,
+            "tokens": minted_tokens.iter().map(|token| {
+                json!({
+                    "token_id": token.token_id,
+                    "receiver_id": sender_id,
+                    "token_metadata": token.metadata
+                })
+            }).collect::<Vec<_>>()
+        });
+        log_str(&format!("METADATA_JSON:{}", metadata_log.to_string()));
 
         // Distribute the payment
         self.distribute_payment(required_amount);
@@ -315,24 +376,19 @@ impl Contract {
         self.metadata.clone()
     }
 
-    pub fn nft_token(&self, token_id: String) -> Option<TokenData> {
-        if let Some(metadata) = self.token_metadata.get(&token_id) {
-            for account_str in self.token_ids.iter() {
-                // Convert String to AccountId
-                let account_id: AccountId = account_str.parse().unwrap();
-                if let Some(tokens) = self.tokens_per_owner.get(&account_id) {
-                    if tokens.contains(&token_id) {
-                        return Some(TokenData {
-                            token_id,
-                            owner_id: account_str,
-                            metadata,
-                            approved_account_ids: HashMap::new(),
-                        });
-                    }
-                }
-            }
+    pub fn nft_token(&self, token_id: TokenId) -> Option<Token> {
+        if let Some(owner_id) = self.tokens.owner_by_id.get(&token_id) {
+            let metadata = self.token_metadata.get(&token_id);
+            
+            Some(Token {
+                token_id,
+                owner_id,
+                metadata,
+                approved_account_ids: Some(HashMap::new()),
+            })
+        } else {
+            None
         }
-        None
     }
 
     // NEP-199 interface for royalty distribution on secondary sales
@@ -463,5 +519,349 @@ impl Contract {
     /// Returns both max supply and current total supply
     pub fn get_supply_stats(&self) -> (u64, u64) {
         (self.max_supply, self.total_supply)
+    }
+
+    /// Allows contract owner to premint specific token IDs
+    #[payable]
+    pub fn premint(&mut self, token_id: String, receiver_id: AccountId) -> TokenData {
+        // Only owner can premint
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can premint tokens"
+        );
+
+        // Check if token_id is valid number and within max supply
+        let token_num = token_id.parse::<u64>()
+            .expect("Token ID must be a number");
+        assert!(
+            token_num <= self.max_supply,
+            "Token ID exceeds max supply"
+        );
+
+        // Ensure token hasn't been minted already
+        assert!(
+            !self.token_ids.contains(&token_id),
+            "Token ID already minted"
+        );
+
+        // Get or create the tokens set for this receiver
+        let mut tokens_set = self.tokens_per_owner
+            .get(&receiver_id)
+            .unwrap_or_else(|| {
+                UnorderedSet::new(
+                    StorageKey::TokensPerOwner { 
+                        account_id_hash: env::sha256(receiver_id.as_bytes())
+                    }
+                )
+            });
+
+        // Create metadata for this token
+        let metadata = TokenMetadata {
+            title: Some(format!("{} #{}", self.metadata.name, token_id)),
+            description: Some(format!("Token {} from collection {}", token_id, self.metadata.name)),
+            media: self.metadata.base_uri.clone().map(|uri| format!("{}/{}.png", uri, token_id)),
+            media_hash: None,
+            copies: Some(1),
+            issued_at: Some(env::block_timestamp().to_string()),
+            expires_at: None,
+            starts_at: None,
+            updated_at: None,
+            extra: None,
+            reference: Some(format!("{}/{}.json", self.metadata.reference, token_id)),
+            reference_hash: None,
+        };
+
+        // Update the core NFT data structure
+        self.tokens.internal_mint_with_refund(
+            token_id.clone(),
+            receiver_id.clone(),
+            Some(metadata.clone()),
+            None,
+        );
+
+        // Store token data
+        tokens_set.insert(&token_id);
+        self.token_metadata.insert(&token_id, &metadata);
+        self.token_ids.insert(&token_id);
+        self.total_supply += 1;
+
+        // Save the updated token set for this owner
+        self.tokens_per_owner.insert(&receiver_id, &tokens_set);
+
+        // Log the mint event
+        let nft_mint_log = json!({
+            "standard": "nep171",
+            "version": "1.1.0",
+            "event": "nft_mint",
+            "data": [{
+                "owner_id": receiver_id,
+                "token_ids": [token_id.clone()],
+            }]
+        });
+        log_str(&format!("EVENT_JSON:{}", nft_mint_log.to_string()));
+
+        TokenData {
+            token_id: token_id.clone(),
+            owner_id: receiver_id.to_string(),
+            metadata,
+            approved_account_ids: None,
+        }
+    }
+
+    /// Allows contract owner to update the collection metadata
+    #[payable]
+    pub fn update_metadata(
+        &mut self,
+        name: Option<String>,
+        symbol: Option<String>,
+        icon: Option<String>,
+        base_uri: Option<String>,
+        reference: Option<String>,
+    ) {
+        // Only owner can update metadata
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can update metadata"
+        );
+
+        // Update only the provided fields
+        if let Some(name) = name {
+            self.metadata.name = name;
+        }
+        if let Some(symbol) = symbol {
+            self.metadata.symbol = symbol;
+        }
+        if let Some(icon) = icon {
+            self.metadata.icon = Some(icon);
+        }
+        if let Some(base_uri) = base_uri {
+            self.metadata.base_uri = Some(base_uri);
+        }
+        if let Some(reference) = reference {
+            assert!(reference.len() > 0, "Reference URL cannot be empty");
+            self.metadata.reference = reference;
+        }
+    }
+
+    /// Allows contract owner to update individual token metadata
+    #[payable]
+    pub fn update_token_metadata(
+        &mut self,
+        token_id: String,
+        title: Option<String>,
+        description: Option<String>,
+        media: Option<String>,
+        media_hash: Option<Base64VecU8>,
+        copies: Option<u64>,
+        extra: Option<String>,
+        reference: Option<String>,
+        reference_hash: Option<Base64VecU8>,
+    ) -> TokenMetadata {
+        // Only owner can update token metadata
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can update token metadata"
+        );
+
+        // Ensure token exists
+        let mut metadata = self.token_metadata.get(&token_id)
+            .expect("Token not found");
+
+        // Update only the provided fields
+        if let Some(title) = title {
+            metadata.title = Some(title);
+        }
+        if let Some(description) = description {
+            metadata.description = Some(description);
+        }
+        if let Some(media) = media {
+            metadata.media = Some(media);
+        }
+        if let Some(media_hash) = media_hash {
+            metadata.media_hash = Some(media_hash);
+        }
+        if let Some(copies) = copies {
+            metadata.copies = Some(copies);
+        }
+        if let Some(extra) = extra {
+            metadata.extra = Some(extra);
+        }
+        if let Some(reference) = reference {
+            metadata.reference = Some(reference);
+        }
+        if let Some(reference_hash) = reference_hash {
+            metadata.reference_hash = Some(reference_hash);
+        }
+
+        // Update the timestamp
+        metadata.updated_at = Some(env::block_timestamp().to_string());
+
+        // Save the updated metadata
+        self.token_metadata.insert(&token_id, &metadata);
+
+        metadata
+    }
+
+    pub fn nft_total_supply(&self) -> U128 {
+        U128(self.total_supply as u128)
+    }
+
+    pub fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<Token> {
+        let start = u128::from(from_index.unwrap_or(U128(0)));
+        let limit = limit.unwrap_or(50) as usize;
+        
+        self.token_ids.iter()
+            .skip(start as usize)
+            .take(limit)
+            .filter_map(|token_id| self.nft_token(token_id))
+            .collect()
+    }
+
+    pub fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
+        self.tokens_per_owner.get(&account_id)
+            .map(|tokens| U128(tokens.len() as u128))
+            .unwrap_or(U128(0))
+    }
+
+
+    /// Get all tokens owned by an account with optional pagination and filtering
+    pub fn get_tokens_for_owner(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+        sort: Option<String>, // "asc" or "desc"
+    ) -> Vec<Token> {
+        let tokens = if let Some(token_set) = self.tokens_per_owner.get(&account_id) {
+            let mut tokens: Vec<_> = token_set.iter().collect();
+            
+            // Apply sorting if specified
+            if let Some(sort_order) = sort {
+                match sort_order.as_str() {
+                    "asc" => tokens.sort(),
+                    "desc" => tokens.sort_by(|a, b| b.cmp(a)),
+                    _ => (), // Invalid sort order, leave unsorted
+                }
+            }
+
+            // Apply pagination
+            let start = u128::from(from_index.unwrap_or(U128(0))) as usize;
+            let limit = limit.unwrap_or(50) as usize;
+
+            tokens.iter()
+                .skip(start)
+                .take(limit)
+                .filter_map(|token_id| self.nft_token(token_id.clone()))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        tokens
+    }
+
+
+    /// Check if an account owns specific tokens
+    pub fn check_token_ownership(&self, account_id: AccountId, token_ids: Vec<String>) -> Vec<bool> {
+        let owned_tokens = self.tokens_per_owner.get(&account_id)
+            .unwrap_or_else(|| UnorderedSet::new(StorageKey::TokensPerOwner {
+                account_id_hash: env::sha256(account_id.as_bytes())
+            }));
+
+        token_ids.iter()
+            .map(|token_id| owned_tokens.contains(token_id))
+            .collect()
+    }
+
+    /// Required for NEP-171 transfers
+    #[payable]
+    pub fn nft_transfer(
+        &mut self,
+        receiver_id: AccountId,
+        token_id: TokenId,
+        approval_id: Option<u64>,
+        memo: Option<String>,
+    ) {
+        Self::assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        
+        // Get tokens for sender
+        let sender_tokens = self.tokens_per_owner.get(&sender_id)
+            .expect("Sender has no tokens");
+        
+        // Verify sender owns the token
+        assert!(
+            sender_tokens.contains(&token_id),
+            "Sender does not own this token"
+        );
+
+        // Remove token from sender
+        let mut sender_tokens = self.tokens_per_owner.get(&sender_id).unwrap();
+        sender_tokens.remove(&token_id);
+        
+        // Update or remove sender's token set
+        if sender_tokens.is_empty() {
+            self.tokens_per_owner.remove(&sender_id);
+        } else {
+            self.tokens_per_owner.insert(&sender_id, &sender_tokens);
+        }
+
+        // Add token to receiver
+        let mut receiver_tokens = self.tokens_per_owner
+            .get(&receiver_id)
+            .unwrap_or_else(|| {
+                UnorderedSet::new(
+                    StorageKey::TokensPerOwner {
+                        account_id_hash: env::sha256(receiver_id.as_bytes())
+                    }
+                )
+            });
+        receiver_tokens.insert(&token_id);
+        self.tokens_per_owner.insert(&receiver_id, &receiver_tokens);
+
+        // Log the transfer
+        if let Some(ref memo) = memo {
+            log_str(&format!("Memo: {}", memo));
+        }
+
+        let nft_transfer_log = json!({
+            "standard": "nep171",
+            "version": "1.1.0",
+            "event": "nft_transfer",
+            "data": [{
+                "authorized_id": approval_id.map(|id| id.to_string()),
+                "old_owner_id": sender_id,
+                "new_owner_id": receiver_id,
+                "token_ids": [token_id],
+                "memo": memo,
+            }]
+        });
+        log_str(&format!("EVENT_JSON:{}", nft_transfer_log.to_string()));
+    }
+
+    /// Helper assert for 1 yoctoNEAR attachments
+    fn assert_one_yocto() {
+        assert_eq!(
+            env::attached_deposit(),
+            NearToken::from_yoctonear(1),
+            "Requires attached deposit of exactly 1 yoctoNEAR"
+        );
+    }
+
+    #[payable]
+    pub fn set_premint_only(&mut self, enabled: bool) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can toggle premint-only mode"
+        );
+        self.premint_only = enabled;
+    }
+
+    pub fn is_premint_only(&self) -> bool {
+        self.premint_only
     }
 }
