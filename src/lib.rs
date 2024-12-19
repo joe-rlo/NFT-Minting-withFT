@@ -4,7 +4,7 @@ use near_sdk::json_types::{Base64VecU8, U128};
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{
     env, near_bindgen, AccountId, PanicOnDefault, Promise, 
-    BorshStorageKey, NearToken
+    BorshStorageKey, NearToken, Gas
 };
 use std::collections::HashMap;
 use near_sdk::env::log_str;
@@ -279,18 +279,35 @@ impl Contract {
     // Single implementation of distribute_payment
     fn distribute_payment(&mut self, amount: U128) {
         let mut remaining_amount = amount.0;
-        let mut promise = Promise::new(self.ft_token_id.clone()); // Start with the FT contract as the initial promise
+        let mut promise = Promise::new(self.ft_token_id.clone())
+            .function_call(
+                "ft_transfer".to_string(),
+                json!({
+                    "receiver_id": self.payout_wallets[0].account_id,
+                    "amount": U128((remaining_amount as f64 * (self.payout_wallets[0].share as f64 / 100.0)) as u128),
+                    "memo": None::<String>
+                }).to_string().into_bytes(),
+                NearToken::from_yoctonear(1),
+                Gas::from_tgas(5)
+            );
         
-        for wallet in &self.payout_wallets {
-            let wallet_share = (remaining_amount as f64 * (wallet.share as f64 / 100.0)) as u128;
+        remaining_amount -= (remaining_amount as f64 * (self.payout_wallets[0].share as f64 / 100.0)) as u128;
+
+        // Start from index 1 since we've already handled the first wallet
+        for wallet in self.payout_wallets.iter().skip(1) {
+            let wallet_share = (amount.0 as f64 * (wallet.share as f64 / 100.0)) as u128;
             if wallet_share > 0 {
                 promise = promise.then(
-                    ext_ft::ext(self.ft_token_id.clone())
-                        .with_attached_deposit(NearToken::from_yoctonear(1))
-                        .ft_transfer(
-                            wallet.account_id.clone(),
-                            U128(wallet_share),
-                            None,
+                    Promise::new(self.ft_token_id.clone())
+                        .function_call(
+                            "ft_transfer".to_string(),
+                            json!({
+                                "receiver_id": wallet.account_id,
+                                "amount": U128(wallet_share),
+                                "memo": None::<String>
+                            }).to_string().into_bytes(),
+                            NearToken::from_yoctonear(1),
+                            Gas::from_tgas(5)
                         )
                 );
                 remaining_amount -= wallet_share;
@@ -300,12 +317,16 @@ impl Contract {
         // Send any dust to the first wallet
         if remaining_amount > 0 && !self.payout_wallets.is_empty() {
             promise = promise.then(
-                ext_ft::ext(self.ft_token_id.clone())
-                    .with_attached_deposit(NearToken::from_yoctonear(1))
-                    .ft_transfer(
-                        self.payout_wallets[0].account_id.clone(),
-                        U128(remaining_amount),
-                        None,
+                Promise::new(self.ft_token_id.clone())
+                    .function_call(
+                        "ft_transfer".to_string(),
+                        json!({
+                            "receiver_id": self.payout_wallets[0].account_id,
+                            "amount": U128(remaining_amount),
+                            "memo": None::<String>
+                        }).to_string().into_bytes(),
+                        NearToken::from_yoctonear(1),
+                        Gas::from_tgas(5)
                     )
             );
         }
