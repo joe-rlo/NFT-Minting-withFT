@@ -38,4 +38,5 @@ tests/config.ts
 *.swp
 *.swo
 *~
-
+misc.md
+mint_script.sh
