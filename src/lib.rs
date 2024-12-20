@@ -15,8 +15,11 @@ use near_sdk::ext_contract;
 use near_contract_standards::non_fungible_token::metadata::{
     NFTContractMetadata, TokenMetadata, NFT_METADATA_SPEC,
 };
+
 use near_contract_standards::non_fungible_token::{Token, TokenId};
 use near_contract_standards::non_fungible_token::NonFungibleToken;
+use near_sdk::assert_one_yocto;
+use near_contract_standards::fungible_token::Balance;
 
 #[ext_contract(ext_ft)]
 trait FungibleToken {
@@ -113,6 +116,7 @@ pub struct Contract {
     pub token_ids: UnorderedSet<String>,
     pub mint_price: U128,
     pub ft_token_id: AccountId,
+    pub ft_decimals: u8,
     pub max_supply: u64,
     pub total_supply: u64,
     pub payout_wallets: Vec<PayoutWallet>,
@@ -125,21 +129,35 @@ pub struct Contract {
 
 #[near_bindgen]
 impl Contract {
+    fn to_token_units(whole_tokens: u128, decimals: u8) -> U128 {
+        U128(whole_tokens * 10u128.pow(decimals as u32))
+    }
+
     #[init]
     pub fn new(
         owner_id: AccountId,
         metadata: NFTMetadata,
         ft_token_id: AccountId,
-        mint_price: U128,
+        ft_decimals: u8,
+        mint_price: String,  // This should be the FULL price including decimals
         max_supply: u64,
-        payout_wallets: Vec<(AccountId, u8)>,
-        royalty_wallets: Vec<(AccountId, u8)>,
+        payout_wallets: Vec<PayoutWallet>,
+        royalty_wallets: Vec<PayoutWallet>,
         total_royalty: u8,
     ) -> Self {
         assert!(!env::state_exists(), "Already initialized");
-        assert!(metadata.reference.len() > 0, "Reference URL required");
+        
+        // Parse the full price directly (no multiplication needed)
+        let mint_price_u128 = mint_price.parse::<u128>()
+            .expect("Invalid mint price format");
 
-        let this = Self {
+        log_str(&format!(
+            "Initializing contract with price {} ({} decimals)",
+            mint_price_u128, ft_decimals
+        ));
+
+        Self {
+            owner_id: owner_id.clone(),
             tokens: NonFungibleToken::new(
                 StorageKey::NonFungibleToken,
                 owner_id.clone(),
@@ -147,43 +165,23 @@ impl Contract {
                 Some(StorageKey::Enumeration),
                 Some(StorageKey::Approval),
             ),
-            owner_id: owner_id.clone(),
-            tokens_per_owner: LookupMap::new(StorageKey::TokensPerOwner { 
-                account_id_hash: Vec::new() 
+            tokens_per_owner: LookupMap::new(StorageKey::TokensPerOwner {
+                account_id_hash: env::sha256(owner_id.as_bytes()),
             }),
             token_metadata: UnorderedMap::new(StorageKey::TokenMetadata),
             token_ids: UnorderedSet::new(StorageKey::TokenIds),
-            mint_price,
+            metadata,
+            mint_price: U128(mint_price_u128),  // Store the full price directly
             ft_token_id,
+            ft_decimals,
             max_supply,
             total_supply: 0,
-            payout_wallets: payout_wallets
-                .into_iter()
-                .map(|(account_id, share)| PayoutWallet { account_id, share })
-                .collect(),
-            royalty_wallets: royalty_wallets
-                .into_iter()
-                .map(|(account_id, share)| PayoutWallet { account_id, share })
-                .collect(),
+            payout_wallets,
+            royalty_wallets,
             total_royalty,
-            metadata,
+            premint_only: false,
             attribute_counts: LookupMap::new(StorageKey::TraitCounts),
-            premint_only: true,
-        };
-
-        
-         // Log contract initialization
-        let init_log = json!({
-            "standard": "nep171",
-            "version": "1.1.0",
-            "event": "init",
-            "data": {
-                "owner_id": owner_id.to_string()
-            }
-        });
-        log_str(&format!("EVENT_JSON:{}", init_log.to_string()));
-
-        this
+        }
     }
 
     #[payable]
@@ -444,13 +442,13 @@ impl Contract {
 
     // Admin methods
     #[payable]
-    pub fn update_mint_price(&mut self, price: U128) {
+    pub fn update_mint_price(&mut self, price: u8) {
         assert_eq!(
             env::predecessor_account_id(),
             self.owner_id,
             "Only owner can update price"
         );
-        self.mint_price = price;
+        self.mint_price = Self::to_token_units(price as u128, self.ft_decimals);
     }
 
     #[payable]
@@ -803,28 +801,29 @@ impl Contract {
         Self::assert_one_yocto();
         let sender_id = env::predecessor_account_id();
         
-        // Get tokens for sender
+        // First verify ownership
         let sender_tokens = self.tokens_per_owner.get(&sender_id)
             .expect("Sender has no tokens");
         
-        // Verify sender owns the token
         assert!(
             sender_tokens.contains(&token_id),
             "Sender does not own this token"
         );
 
-        // Remove token from sender
+        // Update core NFT logic first
+        self.tokens.internal_transfer(
+            &sender_id,
+            &receiver_id,
+            &token_id,
+            approval_id,
+            memo.clone(),
+        );
+
+        // Now handle our custom token tracking
+        // Get fresh copies of the token sets AFTER the core transfer
         let mut sender_tokens = self.tokens_per_owner.get(&sender_id).unwrap();
         sender_tokens.remove(&token_id);
         
-        // Update or remove sender's token set
-        if sender_tokens.is_empty() {
-            self.tokens_per_owner.remove(&sender_id);
-        } else {
-            self.tokens_per_owner.insert(&sender_id, &sender_tokens);
-        }
-
-        // Add token to receiver
         let mut receiver_tokens = self.tokens_per_owner
             .get(&receiver_id)
             .unwrap_or_else(|| {
@@ -834,14 +833,19 @@ impl Contract {
                     }
                 )
             });
+        
+        // Update the token sets
         receiver_tokens.insert(&token_id);
+        
+        // Save the updated sets
+        if sender_tokens.is_empty() {
+            self.tokens_per_owner.remove(&sender_id);
+        } else {
+            self.tokens_per_owner.insert(&sender_id, &sender_tokens);
+        }
         self.tokens_per_owner.insert(&receiver_id, &receiver_tokens);
 
         // Log the transfer
-        if let Some(ref memo) = memo {
-            log_str(&format!("Memo: {}", memo));
-        }
-
         let nft_transfer_log = json!({
             "standard": "nep171",
             "version": "1.1.0",
@@ -854,7 +858,8 @@ impl Contract {
                 "memo": memo,
             }]
         });
-        log_str(&format!("EVENT_JSON:{}", nft_transfer_log.to_string()));
+        log_str("EVENT_JSON:");
+        log_str(&nft_transfer_log.to_string());
     }
 
     /// Helper assert for 1 yoctoNEAR attachments
@@ -879,4 +884,187 @@ impl Contract {
     pub fn is_premint_only(&self) -> bool {
         self.premint_only
     }
+
+    // Add a function to update decimals if needed
+    #[payable]
+    pub fn update_ft_decimals(&mut self, decimals: u8) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can update token decimals"
+        );
+        self.ft_decimals = decimals;
+    }
+
+    #[payable]
+    pub fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>) {
+        // Assert at least one yocto for security
+        assert_at_least_one_yocto();
+
+        // Get the token owner
+        let owner_id = self.tokens.owner_by_id.get(&token_id)
+            .expect("Token not found");
+
+        // Make sure that the person calling the function is the owner of the token
+        assert_eq!(
+            env::predecessor_account_id(),
+            owner_id,
+            "Predecessor must be token owner"
+        );
+
+        // Initialize approvals_by_id if it doesn't exist
+        if self.tokens.approvals_by_id.is_none() {
+            self.tokens.approvals_by_id = Some(LookupMap::new(StorageKey::Approval));
+        }
+
+        // Get or initialize the approvals map
+        let mut approved_account_ids = self.tokens.approvals_by_id
+            .as_ref()
+            .unwrap()  // Safe now because we initialized it above
+            .get(&token_id)
+            .unwrap_or_else(HashMap::new);
+
+        // Check if this is a new approval
+        let is_new_approval = !approved_account_ids.contains_key(&account_id);
+
+        // Generate approval_id
+        let approval_id = env::block_height();  // Using block height ensures uniqueness
+        
+        // Add the approval
+        approved_account_ids.insert(account_id.clone(), approval_id);
+        
+        // Update approvals
+        self.tokens.approvals_by_id.as_mut().unwrap().insert(&token_id, &approved_account_ids);
+
+        // Calculate storage used if this is a new approval
+        let storage_used = if is_new_approval {
+            Self::bytes_for_approved_account_id(&account_id)
+        } else {
+            0
+        };
+
+        // Refund excess storage deposit
+        Self::refund_deposit(storage_used);
+
+        // If msg is provided, initiate cross-contract call
+        if let Some(msg) = msg {
+            Promise::new(account_id)
+                .function_call(
+                    "nft_on_approve".to_string(),
+                    json!({
+                        "token_id": token_id,
+                        "owner_id": owner_id,
+                        "approval_id": approval_id,
+                        "msg": msg,
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    NearToken::from_yoctonear(0),
+                    Gas::from_tgas(10)
+                );
+        }
+    }
+
+    // Add helper functions
+    pub(crate) fn bytes_for_approved_account_id(account_id: &AccountId) -> u64 {
+        // The extra 4 bytes are coming from Borsh serialization to store the length of the string
+        account_id.as_str().len() as u64 + 4 + size_of::<u64>() as u64
+    }
+
+    fn refund_deposit(storage_used: u64) {
+        let required_cost = env::storage_byte_cost().as_yoctonear() * storage_used as u128;
+        let attached_deposit = env::attached_deposit().as_yoctonear();
+        
+        assert!(
+            attached_deposit >= required_cost,
+            "Must attach {} yoctoNEAR to cover storage",
+            required_cost,
+        );
+
+        let refund = attached_deposit - required_cost;
+        if refund > 1 {
+            Promise::new(env::predecessor_account_id()).transfer(NearToken::from_yoctonear(refund));
+        }
+    }
+
+    #[payable]
+    pub fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId) {
+        assert_at_least_one_yocto();
+
+        let owner_id = self.tokens.owner_by_id.get(&token_id)
+            .expect("Token not found");
+
+        assert_eq!(
+            env::predecessor_account_id(),
+            owner_id,
+            "Predecessor must be token owner"
+        );
+
+        // Get and update approvals
+        if let Some(approvals_by_id) = &mut self.tokens.approvals_by_id {
+            if let Some(mut approved_account_ids) = approvals_by_id.get(&token_id) {
+                if approved_account_ids.remove(&account_id).is_some() {
+                    approvals_by_id.insert(&token_id, &approved_account_ids);
+                }
+            }
+        }
+    }
+
+    #[payable]
+    pub fn nft_revoke_all(&mut self, token_id: TokenId) {
+        assert_at_least_one_yocto();
+
+        let owner_id = self.tokens.owner_by_id.get(&token_id)
+            .expect("Token not found");
+
+        assert_eq!(
+            env::predecessor_account_id(),
+            owner_id,
+            "Predecessor must be token owner"
+        );
+
+        if let Some(approvals_by_id) = &mut self.tokens.approvals_by_id {
+            approvals_by_id.remove(&token_id);
+        }
+    }
+
+    pub fn nft_is_approved(
+        &self,
+        token_id: TokenId,
+        approved_account_id: AccountId,
+        approval_id: Option<u64>,
+    ) -> bool {
+        if let Some(approvals) = self.tokens.approvals_by_id.as_ref() {
+            if let Some(approved_accounts) = approvals.get(&token_id) {
+                if let Some(&actual_approval_id) = approved_accounts.get(&approved_account_id) {
+                    approval_id.map_or(true, |id| actual_approval_id == id)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+}
+
+// Fix the approval receiver interface name to match the call
+#[ext_contract(ext_approval_receiver)]
+pub trait ApprovalReceiver {
+    fn nft_on_approve(
+        &mut self,
+        token_id: TokenId,
+        owner_id: AccountId,
+        approval_id: u64,
+        msg: String,
+    ) -> Promise;
+}
+
+fn assert_at_least_one_yocto() {
+    assert!(
+        env::attached_deposit() >= NearToken::from_yoctonear(1),
+        "Requires attached deposit of at least 1 yoctoNEAR"
+    );
 }
