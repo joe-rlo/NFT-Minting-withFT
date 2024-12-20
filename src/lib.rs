@@ -278,57 +278,51 @@ impl Contract {
 
     // Single implementation of distribute_payment
     fn distribute_payment(&mut self, amount: U128) {
-        let mut remaining_amount = amount.0;
-        let mut promise = Promise::new(self.ft_token_id.clone())
-            .function_call(
-                "ft_transfer".to_string(),
-                json!({
-                    "receiver_id": self.payout_wallets[0].account_id,
-                    "amount": U128((remaining_amount as f64 * (self.payout_wallets[0].share as f64 / 100.0)) as u128),
-                    "memo": None::<String>
-                }).to_string().into_bytes(),
-                NearToken::from_yoctonear(1),
-                Gas::from_tgas(5)
-            );
+        let total_amount = amount.0;
+        let mut remaining_amount = total_amount;
+        let mut promise = Promise::new(self.ft_token_id.clone());
         
-        remaining_amount -= (remaining_amount as f64 * (self.payout_wallets[0].share as f64 / 100.0)) as u128;
+        // Process all wallets except the last one
+        for wallet in self.payout_wallets.iter().take(self.payout_wallets.len() - 1) {
+            // Convert share to u128 before multiplication to avoid overflow
+            let share_u128 = u128::from(wallet.share);
+            let wallet_amount = (total_amount * share_u128) / 100u128;
+            remaining_amount -= wallet_amount;
 
-        // Start from index 1 since we've already handled the first wallet
-        for wallet in self.payout_wallets.iter().skip(1) {
-            let wallet_share = (amount.0 as f64 * (wallet.share as f64 / 100.0)) as u128;
-            if wallet_share > 0 {
+            if wallet_amount > 0 {
                 promise = promise.then(
                     Promise::new(self.ft_token_id.clone())
                         .function_call(
                             "ft_transfer".to_string(),
                             json!({
                                 "receiver_id": wallet.account_id,
-                                "amount": U128(wallet_share),
-                                "memo": None::<String>
+                                "amount": U128(wallet_amount),
+                                "memo": Some(format!("Payout share: {}%", wallet.share))
                             }).to_string().into_bytes(),
                             NearToken::from_yoctonear(1),
                             Gas::from_tgas(5)
                         )
                 );
-                remaining_amount -= wallet_share;
             }
         }
 
-        // Send any dust to the first wallet
-        if remaining_amount > 0 && !self.payout_wallets.is_empty() {
-            promise = promise.then(
-                Promise::new(self.ft_token_id.clone())
-                    .function_call(
-                        "ft_transfer".to_string(),
-                        json!({
-                            "receiver_id": self.payout_wallets[0].account_id,
-                            "amount": U128(remaining_amount),
-                            "memo": None::<String>
-                        }).to_string().into_bytes(),
-                        NearToken::from_yoctonear(1),
-                        Gas::from_tgas(5)
-                    )
-            );
+        // Send remaining amount to last wallet
+        if let Some(last_wallet) = self.payout_wallets.last() {
+            if remaining_amount > 0 {
+                promise = promise.then(
+                    Promise::new(self.ft_token_id.clone())
+                        .function_call(
+                            "ft_transfer".to_string(),
+                            json!({
+                                "receiver_id": last_wallet.account_id,
+                                "amount": U128(remaining_amount),
+                                "memo": Some(format!("Payout share: {}% (including dust)", last_wallet.share))
+                            }).to_string().into_bytes(),
+                            NearToken::from_yoctonear(1),
+                            Gas::from_tgas(5)
+                        )
+                );
+            }
         }
     }
 
