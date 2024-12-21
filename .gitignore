@@ -40,3 +40,5 @@ tests/config.ts
 *~
 misc.md
 mint_script.sh
+cleanup_script.sh
+rebuild_script.sh
