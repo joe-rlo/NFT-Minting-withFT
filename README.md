@@ -60,6 +60,9 @@ near call YOUR_CONTRACT_ID new '{
 ### Regular Minting
 To mint NFTs using FT tokens:
 ```bash
+Call the storage_deposit function to deposit storage for the buyer
+near call $NFT_CONTRACT_ID storage_deposit '{"account_id": "BUYER_ID"}' --accountId BUYER_ID --deposit 0.000000000000000000000001
+
 # First approve the NFT contract to use your tokens
 near call $FT_TOKEN_ID ft_transfer '{
     "receiver_id": "'$NFT_CONTRACT_ID'",

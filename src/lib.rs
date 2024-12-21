@@ -269,7 +269,9 @@ impl Contract {
         }
 
         // Save the updated token set for this owner
+        let final_set_size = tokens_set.len();
         self.tokens_per_owner.insert(receiver_id, &tokens_set);
+        log_str(&format!("Updated tokens_per_owner for {}. Set size: {}", receiver_id, final_set_size));
 
         minted_tokens
     }
@@ -802,11 +804,12 @@ impl Contract {
         let sender_id = env::predecessor_account_id();
         
         // First verify ownership
-        let sender_tokens = self.tokens_per_owner.get(&sender_id)
-            .expect("Sender has no tokens");
-        
-        assert!(
-            sender_tokens.contains(&token_id),
+        let owner_id = self.tokens.owner_by_id.get(&token_id)
+            .expect("Token not found");
+
+        assert_eq!(
+            owner_id,
+            sender_id,
             "Sender does not own this token"
         );
 
@@ -820,8 +823,14 @@ impl Contract {
         );
 
         // Now handle our custom token tracking
+        // First verify the token exists and get its data
+        let token = self.nft_token(token_id.clone())
+            .expect("Token not found");
+
         // Get fresh copies of the token sets AFTER the core transfer
-        let mut sender_tokens = self.tokens_per_owner.get(&sender_id).unwrap();
+        let mut sender_tokens = self.tokens_per_owner 
+            .get(&sender_id)
+            .expect("Sender tokens not found in tokens_per_owner");  // Keep strict checking
         sender_tokens.remove(&token_id);
         
         let mut receiver_tokens = self.tokens_per_owner
@@ -1048,6 +1057,233 @@ impl Contract {
             false
         }
     }
+
+
+
+    #[payable]
+    pub fn rebuild_tokens_per_owner(&mut self, from_index: Option<u64>, limit: Option<u64>) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can rebuild tokens_per_owner"
+        );
+
+        let start = from_index.unwrap_or(0);
+        let limit = limit.unwrap_or(50);
+
+        // First collect all tokens and their owners in this batch
+        let mut owner_tokens: std::collections::HashMap<AccountId, Vec<TokenId>> = std::collections::HashMap::new();
+        
+        // Process each token in range
+        for token_id in start..(start + limit) {
+            let token_id = token_id.to_string();
+            
+            if let Some(token) = self.nft_token(token_id.clone()) {
+                log_str(&format!("Found token {} owned by {}", token_id, token.owner_id));
+                
+                // Add to our collection
+                owner_tokens
+                    .entry(token.owner_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(token_id);
+            }
+        }
+
+        // Now process each owner's tokens
+        for (owner_id, new_tokens) in owner_tokens {
+            log_str(&format!("Processing {} tokens for {}", new_tokens.len(), owner_id));
+            
+            // Create a temporary storage key
+            let temp_key = StorageKey::TokensPerOwner {
+                account_id_hash: env::sha256(format!("{}:{}", owner_id, env::block_timestamp()).as_bytes()),
+            };
+            
+            // Create a new temporary set
+            let mut temp_set = UnorderedSet::new(temp_key);
+            
+            // First add any existing tokens
+            if let Some(existing_set) = self.tokens_per_owner.get(&owner_id) {
+                log_str(&format!("Found existing set for {} with {} tokens", owner_id, existing_set.len()));
+                for existing_token in existing_set.iter() {
+                    temp_set.insert(&existing_token);
+                }
+            }
+
+            // Add all new tokens for this owner
+            for token_id in new_tokens.iter() {
+                log_str(&format!("Adding token {} to set for {}", token_id, owner_id));
+                temp_set.insert(token_id);
+            }
+            
+            let size_before_save = temp_set.len();
+            log_str(&format!("Set size for {} before save: {}", owner_id, size_before_save));
+            
+            // Save the complete set
+            self.tokens_per_owner.insert(&owner_id, &temp_set);
+            
+            // Verify the save
+            if let Some(final_set) = self.tokens_per_owner.get(&owner_id) {
+                let final_tokens: Vec<_> = final_set.iter().collect();
+                log_str(&format!("Final set for {} contains {} tokens: {:?}", 
+                    owner_id, final_set.len(), final_tokens));
+            }
+        }
+    }
+
+    // Clean version of get_tokens_per_owner_count
+    pub fn get_tokens_per_owner_count(&self, account_id: AccountId) -> u64 {
+        if let Some(token_set) = self.tokens_per_owner.get(&account_id) {
+            token_set.len() as u64
+        } else {
+            0
+        }
+    }
+
+    // Clean version of nft_tokens_for_owner
+    pub fn nft_tokens_for_owner(
+        &self,
+        account_id: AccountId,
+        from_index: Option<U128>,
+        limit: Option<u64>,
+    ) -> Vec<Token> {
+        let tokens = if let Some(token_set) = self.tokens_per_owner.get(&account_id) {
+            let start = u128::from(from_index.unwrap_or(U128(0))) as usize;
+            let limit = limit.unwrap_or(50) as usize;
+
+            token_set.iter()
+                .skip(start)
+                .take(limit)
+                .filter_map(|token_id| self.nft_token(token_id.clone()))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        tokens
+    }
+
+    #[payable]
+    pub fn cleanup_storage(&mut self, account_index: Option<u64>) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can cleanup storage"
+        );
+
+        // Get initial storage usage
+        let initial_storage = env::storage_usage();
+        log_str(&format!("Initial storage usage: {} bytes", initial_storage));
+
+        // Collect unique accounts (but only until we find the one we want)
+        let mut accounts_to_check = Vec::new();
+        let target_index = account_index.unwrap_or(0) as usize;
+        
+        'outer: for token_id in self.token_ids.iter() {
+            if let Some(token) = self.nft_token(token_id) {
+                if !accounts_to_check.contains(&token.owner_id) {
+                    accounts_to_check.push(token.owner_id);
+                    if accounts_to_check.len() > target_index {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        // Process only the target account if it exists
+        if let Some(account_id) = accounts_to_check.get(target_index) {
+            log_str(&format!("Processing account {}", account_id));
+            
+            if let Some(token_set) = self.tokens_per_owner.get(account_id) {
+                if token_set.is_empty() {
+                    log_str(&format!("Found empty set for account: {}", account_id));
+                    self.tokens_per_owner.remove(account_id);
+                    log_str(&format!("Removed empty set for account: {}", account_id));
+                } else {
+                    // Verify tokens actually exist
+                    let mut valid_tokens = Vec::new();
+                    for token_id in token_set.iter() {
+                        if let Some(_token) = self.nft_token(token_id.clone()) {
+                            valid_tokens.push(token_id);
+                        } else {
+                            log_str(&format!("Found invalid token {} for account {}", token_id, account_id));
+                        }
+                    }
+
+                    // Convert lengths to same type for comparison
+                    let set_len: usize = token_set.len().try_into().unwrap();
+                    let valid_len = valid_tokens.len();
+
+                    // If set needs cleanup
+                    if valid_len < set_len {
+                        log_str(&format!(
+                            "Account {} has {} invalid tokens, rebuilding set",
+                            account_id,
+                            set_len - valid_len
+                        ));
+
+                        // Create new set with only valid tokens
+                        let temp_key = StorageKey::TokensPerOwner {
+                            account_id_hash: env::sha256(format!("{}:{}", account_id, env::block_timestamp()).as_bytes()),
+                        };
+                        let mut new_set = UnorderedSet::new(temp_key);
+                        
+                        for token_id in valid_tokens {
+                            new_set.insert(&token_id);
+                        }
+
+                        // Save the cleaned set
+                        if new_set.is_empty() {
+                            self.tokens_per_owner.remove(account_id);
+                            log_str(&format!("Removed empty set for account: {}", account_id));
+                        } else {
+                            self.tokens_per_owner.insert(account_id, &new_set);
+                            log_str(&format!("Updated set for account: {}", account_id));
+                        }
+                    }
+                }
+            }
+        } else {
+            log_str(&format!("No account found at index {}", target_index));
+        }
+
+        // Get final storage usage and calculate difference
+        let final_storage = env::storage_usage();
+        let storage_freed = if final_storage < initial_storage {
+            initial_storage - final_storage
+        } else {
+            0
+        };
+
+        // Calculate storage cost in NEAR
+        let storage_cost_near = storage_freed as f64 * 0.0001;  // 0.0001 NEAR per byte
+
+        log_str(&format!(
+            "Single account cleanup complete:\n- Freed {} bytes of storage (approximately {} NEAR)",
+            storage_freed,
+            storage_cost_near
+        ));
+    }
+
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        let storage_account_id = account_id
+            .map(|a| a.into())
+            .unwrap_or_else(env::predecessor_account_id);
+
+        let deposit = env::attached_deposit().as_yoctonear();
+        
+        // No need to check if deposit >= 0 since it's an unsigned integer
+        
+        // Transfer the deposit to the contract to cover future storage costs
+        Promise::new(env::current_account_id())
+            .transfer(NearToken::from_yoctonear(deposit));
+
+        log_str(&format!(
+            "Received storage deposit of {} yoctoNEAR for account {}",
+            deposit,
+            storage_account_id
+        ));
+    }
 }
 
 // Fix the approval receiver interface name to match the call
@@ -1067,4 +1303,20 @@ fn assert_at_least_one_yocto() {
         env::attached_deposit() >= NearToken::from_yoctonear(1),
         "Requires attached deposit of at least 1 yoctoNEAR"
     );
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct DebugTokenInfo {
+    token_id: TokenId,
+    owner_from_nft_token: Option<AccountId>,
+    found_in_tokens_per_owner: bool,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct DebugOwnerInfo {
+    count: u64,
+    has_set: bool,
+    example_tokens: Vec<TokenId>
 }
