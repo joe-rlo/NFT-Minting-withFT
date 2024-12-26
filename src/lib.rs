@@ -4,13 +4,12 @@ use near_sdk::json_types::{Base64VecU8, U128};
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{
     env, near_bindgen, AccountId, PanicOnDefault, Promise, 
-    BorshStorageKey, NearToken, Gas
+    BorshStorageKey, NearToken, Gas, PromiseResult, PromiseOrValue
 };
 use std::collections::HashMap;
 use near_sdk::env::log_str;
 use near_sdk::serde_json::json;
 use near_sdk::serde_json;
-use near_sdk::{PromiseOrValue};
 use near_sdk::ext_contract;
 use near_contract_standards::non_fungible_token::metadata::{
     NFTContractMetadata, TokenMetadata, NFT_METADATA_SPEC,
@@ -127,6 +126,15 @@ pub struct Contract {
     pub premint_only: bool,
 }
 
+#[ext_contract(ext_self)]
+pub trait ExtSelf {
+    fn on_ft_transfer_complete(
+        &mut self,
+        sender_id: AccountId,
+        number_of_tokens: u64,
+    ) -> Vec<TokenData>;
+}
+
 #[near_bindgen]
 impl Contract {
     fn to_token_units(whole_tokens: u128, decimals: u8) -> U128 {
@@ -192,17 +200,13 @@ impl Contract {
 
     fn get_next_token_id(&self) -> String {
         let mut next_id = 0;
-        
-        // Keep incrementing until we find an unminted ID
-        while self.token_ids.contains(&next_id.to_string()) {
+        while next_id < self.max_supply {
+            if !self.token_ids.contains(&next_id.to_string()) {
+                return next_id.to_string();
+            }
             next_id += 1;
-            assert!(
-                next_id < self.max_supply,
-                "No more tokens available to mint"
-            );
         }
-        
-        next_id.to_string()
+        env::panic_str("No more tokens available");
     }
 
     fn internal_mint_many(
@@ -215,6 +219,12 @@ impl Contract {
             "Would exceed max supply"
         );
 
+        // Pre-allocate vectors and get references once
+        let mut minted_tokens = Vec::with_capacity(number_of_tokens as usize);
+        let base_uri = self.metadata.base_uri.as_ref();
+        let reference = &self.metadata.reference;
+
+        // Get or create tokens set once
         let mut tokens_set = self.tokens_per_owner
             .get(receiver_id)
             .unwrap_or_else(|| {
@@ -225,28 +235,26 @@ impl Contract {
                 )
             });
 
-        let mut minted_tokens = Vec::with_capacity(number_of_tokens as usize);
-
         for _ in 0..number_of_tokens {
             let token_id = self.get_next_token_id();
             
-            // Create metadata for this token
+            // Minimal metadata
             let metadata = TokenMetadata {
                 title: Some(format!("{} #{}", self.metadata.name, token_id)),
-                description: Some(format!("Token {} from collection {}", token_id, self.metadata.name)),
-                media: self.metadata.base_uri.clone().map(|uri| format!("{}/{}.png", uri, token_id)),
+                description: None,
+                media: base_uri.map(|uri| format!("{}/{}.png", uri, token_id)),
                 media_hash: None,
                 copies: Some(1),
-                issued_at: Some(env::block_timestamp().to_string()),
+                issued_at: None,
                 expires_at: None,
                 starts_at: None,
                 updated_at: None,
                 extra: None,
-                reference: Some(format!("{}/{}.json", self.metadata.reference, token_id)),
+                reference: Some(format!("{}/{}.json", reference, token_id)),
                 reference_hash: None,
             };
 
-            // Update the core NFT data structure
+            // Batch operations
             self.tokens.internal_mint_with_refund(
                 token_id.clone(),
                 receiver_id.clone(),
@@ -254,24 +262,21 @@ impl Contract {
                 None,
             );
 
-            // Store token data in custom storage
             tokens_set.insert(&token_id);
             self.token_metadata.insert(&token_id, &metadata);
             self.token_ids.insert(&token_id);
             self.total_supply += 1;
 
             minted_tokens.push(TokenData {
-                token_id: token_id.clone(),
+                token_id,
                 owner_id: receiver_id.to_string(),
                 metadata,
                 approved_account_ids: None,
             });
         }
 
-        // Save the updated token set for this owner
-        let final_set_size = tokens_set.len();
+        // Single storage write for tokens_set
         self.tokens_per_owner.insert(receiver_id, &tokens_set);
-        log_str(&format!("Updated tokens_per_owner for {}. Set size: {}", receiver_id, final_set_size));
 
         minted_tokens
     }
@@ -332,23 +337,61 @@ impl Contract {
         amount: U128,
         msg: String,
     ) -> PromiseOrValue<U128> {
-        assert!(
-            !self.premint_only,
-            "Minting is currently restricted to premint only"
-        );
+        if self.premint_only {
+            return PromiseOrValue::Value(amount);
+        }
 
-        let args: FtOnTransferArgs = serde_json::from_str(&msg)
-            .unwrap_or(FtOnTransferArgs { number_of_tokens: Some(1) });
+        // Simple number parsing
+        let number_of_tokens = msg.parse::<u64>().unwrap_or(1);
+        let required_amount = self.mint_price.0.saturating_mul(number_of_tokens as u128);
         
-        let number_of_tokens = args.number_of_tokens.unwrap_or(1);
-        let required_amount = U128(self.mint_price.0.checked_mul(number_of_tokens as u128)
-            .expect("Multiplication overflow"));
-        
-        assert!(
-            amount.0 >= required_amount.0,
-            "Insufficient FT tokens sent for minting"
-        );
+        if amount.0 < required_amount {
+            return PromiseOrValue::Value(amount);
+        }
 
+        // Direct minting
+        let minted_tokens = self.internal_mint_many(&sender_id, number_of_tokens);
+        let token_ids: Vec<String> = minted_tokens.iter()
+            .map(|t| t.token_id.clone())
+            .collect();
+        
+        // Single event log
+        log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"nep171\",\"version\":\"1.0.0\",\"event\":\"nft_mint\",\"data\":[{{\"owner_id\":\"{}\",\"token_ids\":{:?}}}]}}",
+            sender_id,
+            token_ids
+        ));
+
+        PromiseOrValue::Value(U128(amount.0 - required_amount))
+    }
+
+    #[private]
+    pub fn on_ft_transfer_complete(
+        &mut self,
+        sender_id: AccountId,
+        number_of_tokens: u64,
+    ) -> Vec<TokenData> {
+        // Verify the payment callbacks succeeded
+        assert!(env::promise_results_count() > 0, "No promise results");
+        
+        // Check if all previous promises succeeded
+        let mut all_promises_succeeded = true;
+        for i in 0..env::promise_results_count() {
+            match env::promise_result(i) {
+                PromiseResult::Successful(_) => continue,
+                _ => {
+                    all_promises_succeeded = false;
+                    break;
+                }
+            }
+        }
+
+        if !all_promises_succeeded {
+            log_str("Payment distribution failed. Aborting mint.");
+            return vec![];
+        }
+
+        // If we get here, all payments succeeded, so we can mint
         let minted_tokens = self.internal_mint_many(
             &sender_id,
             number_of_tokens
@@ -379,11 +422,7 @@ impl Contract {
         });
         log_str(&format!("METADATA_JSON:{}", metadata_log.to_string()));
 
-        // Distribute the payment
-        self.distribute_payment(required_amount);
-
-        // Return unused tokens
-        PromiseOrValue::Value(U128(amount.0 - required_amount.0))
+        minted_tokens
     }
 
     // View methods
@@ -800,7 +839,7 @@ impl Contract {
         approval_id: Option<u64>,
         memo: Option<String>,
     ) {
-        Self::assert_one_yocto();
+        Self::assert_at_least_one_yocto();
         let sender_id = env::predecessor_account_id();
         
         // First verify ownership
@@ -854,7 +893,7 @@ impl Contract {
         }
         self.tokens_per_owner.insert(&receiver_id, &receiver_tokens);
 
-        // Log the transfer
+        // Log the transfer in a single call
         let nft_transfer_log = json!({
             "standard": "nep171",
             "version": "1.1.0",
@@ -867,16 +906,14 @@ impl Contract {
                 "memo": memo,
             }]
         });
-        log_str("EVENT_JSON:");
-        log_str(&nft_transfer_log.to_string());
+        log_str(&format!("EVENT_JSON:{}", nft_transfer_log));
     }
 
     /// Helper assert for 1 yoctoNEAR attachments
-    fn assert_one_yocto() {
-        assert_eq!(
-            env::attached_deposit(),
-            NearToken::from_yoctonear(1),
-            "Requires attached deposit of exactly 1 yoctoNEAR"
+    fn assert_at_least_one_yocto() {
+        assert!(
+            env::attached_deposit() >= NearToken::from_yoctonear(1),
+            "Requires attached deposit of at least 1 yoctoNEAR"
         );
     }
 
@@ -1078,14 +1115,27 @@ impl Contract {
         for token_id in start..(start + limit) {
             let token_id = token_id.to_string();
             
-            if let Some(token) = self.nft_token(token_id.clone()) {
-                log_str(&format!("Found token {} owned by {}", token_id, token.owner_id));
+            // Get current owner from core NFT logic
+            if let Some(current_owner) = self.tokens.owner_by_id.get(&token_id) {
+                log_str(&format!("Found token {} owned by {}", token_id, current_owner));
                 
-                // Add to our collection
-                owner_tokens
-                    .entry(token.owner_id.clone())
-                    .or_insert_with(Vec::new)
-                    .push(token_id);
+                // Verify against nft_token for double-checking
+                if let Some(token) = self.nft_token(token_id.clone()) {
+                    assert_eq!(
+                        current_owner,
+                        token.owner_id,
+                        "Owner mismatch for token {}: {} vs {}",
+                        token_id,
+                        current_owner,
+                        token.owner_id
+                    );
+                    
+                    // Add to our collection using verified owner
+                    owner_tokens
+                        .entry(current_owner.clone())
+                        .or_insert_with(Vec::new)
+                        .push(token_id);
+                }
             }
         }
 
@@ -1101,15 +1151,20 @@ impl Contract {
             // Create a new temporary set
             let mut temp_set = UnorderedSet::new(temp_key);
             
-            // First add any existing tokens
+            // First add any existing tokens that are still owned by this account
             if let Some(existing_set) = self.tokens_per_owner.get(&owner_id) {
                 log_str(&format!("Found existing set for {} with {} tokens", owner_id, existing_set.len()));
                 for existing_token in existing_set.iter() {
-                    temp_set.insert(&existing_token);
+                    // Only keep tokens still owned by this account
+                    if let Some(current_owner) = self.tokens.owner_by_id.get(&existing_token) {
+                        if current_owner == owner_id {
+                            temp_set.insert(&existing_token);
+                        }
+                    }
                 }
             }
 
-            // Add all new tokens for this owner
+            // Add all verified new tokens for this owner
             for token_id in new_tokens.iter() {
                 log_str(&format!("Adding token {} to set for {}", token_id, owner_id));
                 temp_set.insert(token_id);
@@ -1118,14 +1173,19 @@ impl Contract {
             let size_before_save = temp_set.len();
             log_str(&format!("Set size for {} before save: {}", owner_id, size_before_save));
             
-            // Save the complete set
-            self.tokens_per_owner.insert(&owner_id, &temp_set);
-            
-            // Verify the save
-            if let Some(final_set) = self.tokens_per_owner.get(&owner_id) {
-                let final_tokens: Vec<_> = final_set.iter().collect();
-                log_str(&format!("Final set for {} contains {} tokens: {:?}", 
-                    owner_id, final_set.len(), final_tokens));
+            // Save the complete set or remove if empty
+            if temp_set.is_empty() {
+                self.tokens_per_owner.remove(&owner_id);
+                log_str(&format!("Removed empty set for account: {}", owner_id));
+            } else {
+                self.tokens_per_owner.insert(&owner_id, &temp_set);
+                
+                // Verify the save
+                if let Some(final_set) = self.tokens_per_owner.get(&owner_id) {
+                    let final_tokens: Vec<_> = final_set.iter().collect();
+                    log_str(&format!("Final set for {} contains {} tokens: {:?}", 
+                        owner_id, final_set.len(), final_tokens));
+                }
             }
         }
     }
@@ -1283,6 +1343,236 @@ impl Contract {
             deposit,
             storage_account_id
         ));
+    }
+
+    #[payable]
+    pub fn admin_distribute_tokens(&mut self) -> Promise {
+        // Only owner can distribute tokens
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner_id,
+            "Only owner can distribute tokens"
+        );
+
+        // Get contract's token balance first
+        Promise::new(self.ft_token_id.clone())
+            .function_call(
+                "ft_balance_of".to_string(),
+                json!({
+                    "account_id": env::current_account_id()
+                })
+                .to_string()
+                .into_bytes(),
+                NearToken::from_yoctonear(1),
+                Gas::from_tgas(5)
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(180))
+                    .on_get_balance_for_distribution()
+            )
+    }
+
+    #[private]
+    pub fn on_get_balance_for_distribution(&mut self) -> Promise {
+        assert_eq!(env::promise_results_count(), 1, "Expected 1 promise result");
+        
+        let balance: U128 = match env::promise_result(0) {
+            PromiseResult::Successful(value) => near_sdk::serde_json::from_slice(&value).unwrap(),
+            _ => {
+                log_str("Failed to get balance");
+                return Promise::new(env::current_account_id());
+            }
+        };
+
+        log_str(&format!("Distributing balance of {}", balance.0));
+
+        let mut promise = Promise::new(self.ft_token_id.clone());
+        let mut remaining_amount = balance.0;
+
+        // Process all wallets except the last one
+        for wallet in self.payout_wallets.iter().take(self.payout_wallets.len() - 1) {
+            let share_u128 = u128::from(wallet.share);
+            let wallet_amount = (balance.0 * share_u128) / 100u128;
+            remaining_amount = remaining_amount.saturating_sub(wallet_amount);
+
+            if wallet_amount > 0 {
+                promise = promise.then(
+                    Promise::new(self.ft_token_id.clone())
+                        .function_call(
+                            "ft_transfer".to_string(),
+                            json!({
+                                "receiver_id": wallet.account_id,
+                                "amount": U128(wallet_amount),
+                                "memo": Some(format!("Payout share: {}%", wallet.share))
+                            })
+                            .to_string()
+                            .into_bytes(),
+                            NearToken::from_yoctonear(1),
+                            Gas::from_tgas(10)
+                        )
+                );
+
+                log_str(&format!(
+                    "Scheduled transfer of {} tokens to {} ({}%)",
+                    wallet_amount,
+                    wallet.account_id,
+                    wallet.share
+                ));
+            }
+        }
+
+        // Send remaining amount to last wallet
+        if let Some(last_wallet) = self.payout_wallets.last() {
+            if remaining_amount > 0 {
+                promise = promise.then(
+                    Promise::new(self.ft_token_id.clone())
+                        .function_call(
+                            "ft_transfer".to_string(),
+                            json!({
+                                "receiver_id": last_wallet.account_id,
+                                "amount": U128(remaining_amount),
+                                "memo": Some(format!("Final payout share: {}%", last_wallet.share))
+                            })
+                            .to_string()
+                            .into_bytes(),
+                            NearToken::from_yoctonear(1),
+                            Gas::from_tgas(10)
+                        )
+                );
+
+                log_str(&format!(
+                    "Scheduled final transfer of {} tokens to {} ({}%)",
+                    remaining_amount,
+                    last_wallet.account_id,
+                    last_wallet.share
+                ));
+            }
+        }
+
+        promise
+    }
+
+    // Add a view method to check contract's token balance
+    pub fn get_contract_token_balance(&self) -> Promise {
+        Promise::new(self.ft_token_id.clone())
+            .function_call(
+                "ft_balance_of".to_string(),
+                json!({
+                    "account_id": env::current_account_id()
+                })
+                .to_string()
+                .into_bytes(),
+                NearToken::from_yoctonear(1),
+                Gas::from_tgas(5)
+            )
+    }
+
+    /// Returns a list of unminted token IDs within the specified range
+    pub fn get_unminted_tokens(&self, start: u64, end: u64) -> Vec<String> {
+        assert!(end >= start, "End must be greater than or equal to start");
+        assert!(end <= self.max_supply, "End cannot exceed max supply");
+        
+        let mut unminted = Vec::new();
+        for id in start..=end {
+            let token_id = id.to_string();
+            if !self.token_ids.contains(&token_id) {
+                unminted.push(token_id);
+            }
+        }
+        
+        unminted
+    }
+
+    /// Returns the total number of minted tokens
+    pub fn get_total_minted(&self) -> u64 {
+        self.total_supply
+    }
+
+    /// Returns the next available token ID
+    pub fn get_next_available_id(&self) -> String {
+        self.get_next_token_id()
+    }
+
+    /// Diagnostic function to check token counts and next available ID
+    pub fn check_token_status(&self) -> String {
+        let total_supply = self.total_supply;
+        let tokens_in_set = self.token_ids.len();
+        
+        // Find the actual next available ID
+        let mut next_available = 0;
+        while self.token_ids.contains(&next_available.to_string()) {
+            next_available += 1;
+            if next_available >= self.max_supply {
+                break;
+            }
+        }
+
+        // Get a sample of existing tokens
+        let mut sample_tokens = Vec::new();
+        let mut count = 0;
+        for id in 0..std::cmp::min(10, self.max_supply) {
+            if self.token_ids.contains(&id.to_string()) {
+                sample_tokens.push(id);
+                count += 1;
+                if count >= 5 {
+                    break;
+                }
+            }
+        }
+
+        format!(
+            "Status:\n\
+             Total Supply Counter: {}\n\
+             Actual Tokens in Set: {}\n\
+             Next Available ID: {}\n\
+             Sample of Existing Tokens: {:?}\n\
+             Max Supply: {}",
+            total_supply,
+            tokens_in_set,
+            next_available,
+            sample_tokens,
+            self.max_supply
+        )
+    }
+
+    /// Get basic stats about token status
+    pub fn get_token_stats(&self) -> (u64, u64, u64) {
+        (
+            self.total_supply,      // Total supply counter
+            self.token_ids.len(),   // Actual tokens in set
+            self.max_supply         // Max supply
+        )
+    }
+
+    /// Check if a specific token ID exists
+    pub fn token_exists(&self, token_id: String) -> bool {
+        self.token_ids.contains(&token_id)
+    }
+
+    /// Get a range of token existence status
+    pub fn check_token_range(&self, start: u64, end: u64) -> Vec<bool> {
+        assert!(end >= start, "End must be greater than start");
+        assert!(end - start <= 100, "Can only check 100 tokens at a time");
+        
+        let mut results = Vec::with_capacity((end - start) as usize);
+        for id in start..end {
+            results.push(self.token_ids.contains(&id.to_string()));
+        }
+        results
+    }
+
+    /// Find the first available token ID in a range
+    pub fn find_first_available(&self, start: u64, end: u64) -> Option<u64> {
+        assert!(end >= start, "End must be greater than start");
+        assert!(end - start <= 100, "Can only check 100 tokens at a time");
+        
+        for id in start..end {
+            if !self.token_ids.contains(&id.to_string()) {
+                return Some(id);
+            }
+        }
+        None
     }
 }
 

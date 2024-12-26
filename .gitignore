@@ -42,3 +42,4 @@ misc.md
 mint_script.sh
 cleanup_script.sh
 rebuild_script.sh
+rebuild_tokens.sh
